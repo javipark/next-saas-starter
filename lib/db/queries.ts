@@ -1,49 +1,38 @@
-import { desc, and, eq, isNull } from 'drizzle-orm';
-import { db } from './drizzle';
-import { activityLogs, teamMembers, teams, users } from './schema';
-import { cookies } from 'next/headers';
-import { verifyToken } from '@/lib/auth/session';
+import { supabase } from '@/lib/supabase/client';
 
 export async function getUser() {
-  const sessionCookie = cookies().get('session');
-  if (!sessionCookie || !sessionCookie.value) {
+  const { data: session } = await supabase.auth.getSession();
+  if (!session || !session.session) {
     return null;
   }
 
-  const sessionData = await verifyToken(sessionCookie.value);
-  if (
-    !sessionData ||
-    !sessionData.user ||
-    typeof sessionData.user.id !== 'number'
-  ) {
+  const { data: user, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('id', session.session.user.id)
+    .single();
+
+  if (error) {
+    console.error('Error fetching user:', error);
     return null;
   }
 
-  if (new Date(sessionData.expires) < new Date()) {
-    return null;
-  }
-
-  const user = await db
-    .select()
-    .from(users)
-    .where(and(eq(users.id, sessionData.user.id), isNull(users.deletedAt)))
-    .limit(1);
-
-  if (user.length === 0) {
-    return null;
-  }
-
-  return user[0];
+  return user;
 }
 
 export async function getTeamByStripeCustomerId(customerId: string) {
-  const result = await db
-    .select()
-    .from(teams)
-    .where(eq(teams.stripeCustomerId, customerId))
-    .limit(1);
+  const { data, error } = await supabase
+    .from('teams')
+    .select('*')
+    .eq('stripe_customer_id', customerId)
+    .single();
 
-  return result.length > 0 ? result[0] : null;
+  if (error) {
+    console.error('Error fetching team:', error);
+    return null;
+  }
+
+  return data;
 }
 
 export async function updateTeamSubscription(
@@ -55,27 +44,37 @@ export async function updateTeamSubscription(
     subscriptionStatus: string;
   }
 ) {
-  await db
-    .update(teams)
-    .set({
+  const { error } = await supabase
+    .from('teams')
+    .update({
       ...subscriptionData,
-      updatedAt: new Date(),
+      updated_at: new Date().toISOString(),
     })
-    .where(eq(teams.id, teamId));
+    .eq('id', teamId);
+
+  if (error) {
+    console.error('Error updating team subscription:', error);
+  }
 }
 
 export async function getUserWithTeam(userId: number) {
-  const result = await db
-    .select({
-      user: users,
-      teamId: teamMembers.teamId,
-    })
-    .from(users)
-    .leftJoin(teamMembers, eq(users.id, teamMembers.userId))
-    .where(eq(users.id, userId))
-    .limit(1);
+  const { data, error } = await supabase
+    .from('users')
+    .select(`
+      *,
+      team_members!inner(
+        team_id
+      )
+    `)
+    .eq('id', userId)
+    .single();
 
-  return result[0];
+  if (error) {
+    console.error('Error fetching user with team:', error);
+    return null;
+  }
+
+  return data;
 }
 
 export async function getActivityLogs() {
@@ -84,46 +83,51 @@ export async function getActivityLogs() {
     throw new Error('User not authenticated');
   }
 
-  return await db
-    .select({
-      id: activityLogs.id,
-      action: activityLogs.action,
-      timestamp: activityLogs.timestamp,
-      ipAddress: activityLogs.ipAddress,
-      userName: users.name,
-    })
-    .from(activityLogs)
-    .leftJoin(users, eq(activityLogs.userId, users.id))
-    .where(eq(activityLogs.userId, user.id))
-    .orderBy(desc(activityLogs.timestamp))
+  const { data, error } = await supabase
+    .from('activity_logs')
+    .select(`
+      id,
+      action,
+      timestamp,
+      ip_address,
+      users(name)
+    `)
+    .eq('user_id', user.id)
+    .order('timestamp', { ascending: false })
     .limit(10);
+
+  if (error) {
+    console.error('Error fetching activity logs:', error);
+    return [];
+  }
+
+  return data;
 }
 
 export async function getTeamForUser(userId: number) {
-  const result = await db.query.users.findFirst({
-    where: eq(users.id, userId),
-    with: {
-      teamMembers: {
-        with: {
-          team: {
-            with: {
-              teamMembers: {
-                with: {
-                  user: {
-                    columns: {
-                      id: true,
-                      name: true,
-                      email: true,
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-  });
+  const { data, error } = await supabase
+    .from('users')
+    .select(`
+      team_members!inner(
+        team:teams(
+          *,
+          team_members(
+            user:users(
+              id,
+              name,
+              email
+            )
+          )
+        )
+      )
+    `)
+    .eq('id', userId)
+    .single();
 
-  return result?.teamMembers[0]?.team || null;
+  if (error) {
+    console.error('Error fetching team for user:', error);
+    return null;
+  }
+
+  return data?.team_members[0]?.team || null;
 }
